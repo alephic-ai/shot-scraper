@@ -1,5 +1,6 @@
 import pathlib
 import shutil
+import subprocess
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
@@ -988,6 +989,8 @@ def test_video_hq_records_frames_and_encodes(mocker, tmp_path):
     _, args, cfr_contents = ffmpeg_events[0]
     assert args[:5] == ["ffmpeg", "-y", "-framerate", "30", "-i"]
     assert args[6:] == [
+        "-vf",
+        "pad=ceil(iw/2)*2:ceil(ih/2)*2:0:0:black",
         "-c:v",
         "libx264",
         "-crf",
@@ -1398,3 +1401,50 @@ def test_har_extract_content_type_extension(http_server):
         assert (
             len(html_files) >= 1
         ), f"Should have .html file, got: {list(extract_dir.glob('*'))}"
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_hq_encode_pads_odd_viewport_dimensions(tmpdir):
+    # yuv420p rejects odd dimensions; the encoder must pad rather than fail
+    # after a completed capture (fork PR #1 review finding).
+    frames = []
+    for i in range(3):
+        frame_path = str(tmpdir / "frame-{:05d}.jpg".format(i))
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=white:s=641x361",
+                "-frames:v",
+                "1",
+                frame_path,
+            ],
+            capture_output=True,
+            check=True,
+        )
+        frames.append(frame_path)
+    output = str(tmpdir / "out.mp4")
+    cli_module._encode_hq_video(
+        frames, [1000.0, 1400.0, 1800.0], 2000.0, output, silent=True
+    )
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0",
+            output,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert probe.stdout.strip() == "642,362"

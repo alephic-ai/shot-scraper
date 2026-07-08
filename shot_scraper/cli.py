@@ -781,6 +781,10 @@ def _encode_hq_video(frame_paths, frame_timestamps, stop_ms, output, silent=Fals
             str(HQ_VIDEO_FPS),
             "-i",
             os.path.join(cfr_dir, "frame-%05d.jpg"),
+            # yuv420p requires even dimensions; pad odd viewports by one
+            # bottom/right pixel instead of failing after a full capture
+            "-vf",
+            "pad=ceil(iw/2)*2:ceil(ih/2)*2:0:0:black",
             "-c:v",
             "libx264",
             "-crf",
