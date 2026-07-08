@@ -67,6 +67,18 @@ shot-scraper video storyboard.yml --mp4
 
 If `ffmpeg` is not installed, the WebM file is still created but the command exits with a non-zero status and an error explaining that the MP4 was not created.
 
+Use `--hq` to record at maximum quality. Instead of the built-in real-time WebM encoder, this captures full quality JPEG frames as the page changes, reconstructs the recording timeline and encodes it as a 30fps high quality MP4 using `ffmpeg` (which must be installed). With `--hq` the output filename must end in `.mp4` and no WebM file is written, so `--mp4` is not allowed:
+
+```bash
+shot-scraper video storyboard.yml -o demo.mp4 --hq
+```
+
+Use `--page-zoom` to apply a CSS zoom to the page before recording starts. Combined with a proportionally larger `viewport:` in the storyboard this records the page at a higher pixel density - for example `--page-zoom 2` with a 2560x1440 viewport records a 1280x720 layout at twice the resolution:
+
+```bash
+shot-scraper video storyboard.yml -o demo.mp4 --hq --page-zoom 2
+```
+
 ## Storyboard structure
 
 A storyboard file is a YAML mapping with these keys:
@@ -679,6 +691,8 @@ Use `--silent` to hide progress messages. Use `--leave-server` to leave a config
 
 Use `--mp4` to create an MP4 copy of the recorded WebM video. This requires `ffmpeg` to be installed. The command will then create both a `filename.webm` and `filename.mp4` file.
 
+Use `--hq` to skip the WebM entirely and encode a maximum quality 30fps MP4 with `ffmpeg`, and `--page-zoom` to apply a CSS zoom to the page before recording.
+
 ## `shot-scraper video --help`
 
 Full `--help` for this command:
@@ -703,6 +717,7 @@ Usage: shot-scraper video [OPTIONS] STORYBOARD_FILE
 
       shot-scraper video storyboard.yml
       shot-scraper video storyboard.yml -o demo.webm --mp4
+      shot-scraper video storyboard.yml -o demo.mp4 --hq
 
   A storyboard is a YAML mapping with an output filename, a starting URL (or an
   opening scene), and a list of scenes. Each scene can wait, run commands, run
@@ -744,7 +759,8 @@ Usage: shot-scraper video [OPTIONS] STORYBOARD_FILE
 
       output: WebM filename. -o/--output overrides this. With --mp4, an MP4
         is also written using the same filename with the suffix replaced by
-        .mp4.
+        .mp4. With --hq the filename must end in .mp4 and only that MP4 is
+        written.
       url: Starting URL, bare domain, or local HTML path. Omit this only if
         the first scene has open:.
       sh: Shell command string or argument list to run before python: and
@@ -793,8 +809,8 @@ Usage: shot-scraper video [OPTIONS] STORYBOARD_FILE
   https://shot-scraper.datasette.io/en/stable/video.html
 
 Options:
-  -o, --output FILE               Output video filename (.webm), overriding
-                                  output: in the storyboard
+  -o, --output FILE               Output video filename (.webm, or .mp4 with
+                                  --hq), overriding output: in the storyboard
   -a, --auth FILENAME             Path to JSON authentication context file
   --timeout INTEGER               Wait this many milliseconds before failing
   -b, --browser [chromium|firefox|webkit|chrome|chrome-beta]
@@ -813,6 +829,10 @@ Options:
   --leave-server                  Leave servers running when script finishes
   --mp4                           Also convert the recorded WebM video to MP4
                                   using ffmpeg
+  --hq                            Record maximum quality frames and encode
+                                  straight to MP4 using ffmpeg
+  --page-zoom FLOAT RANGE         Apply this CSS zoom to the page before
+                                  recording  [x>0]
   --help                          Show this message and exit.
 ```
 <!-- [[[end]]] -->

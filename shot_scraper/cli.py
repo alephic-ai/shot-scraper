@@ -1,7 +1,9 @@
 import base64
 import secrets
+import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 import json
@@ -483,7 +485,8 @@ def _browser_context(
     "-o",
     "--output",
     type=click.Path(file_okay=True, writable=True, dir_okay=False, allow_dash=False),
-    help="Output video filename (.webm), overriding output: in the storyboard",
+    help="Output video filename (.webm, or .mp4 with --hq), overriding output: "
+    "in the storyboard",
 )
 @click.option(
     "-a",
@@ -516,6 +519,16 @@ def _browser_context(
     is_flag=True,
     help="Also convert the recorded WebM video to MP4 using ffmpeg",
 )
+@click.option(
+    "--hq",
+    is_flag=True,
+    help="Record maximum quality frames and encode straight to MP4 using ffmpeg",
+)
+@click.option(
+    "--page-zoom",
+    type=click.FloatRange(min=0, min_open=True),
+    help="Apply this CSS zoom to the page before recording",
+)
 def video(
     storyboard_file,
     output,
@@ -534,6 +547,8 @@ def video(
     auth_password,
     leave_server,
     mp4,
+    hq,
+    page_zoom,
 ):
     """
     Record a WebM video from a YAML storyboard.
@@ -543,6 +558,7 @@ def video(
     \b
         shot-scraper video storyboard.yml
         shot-scraper video storyboard.yml -o demo.webm --mp4
+        shot-scraper video storyboard.yml -o demo.mp4 --hq
 
     A storyboard is a YAML mapping with an output filename, a starting URL (or
     an opening scene), and a list of scenes. Each scene can wait, run commands,
@@ -586,7 +602,8 @@ def video(
     \b
         output: WebM filename. -o/--output overrides this. With --mp4, an MP4
           is also written using the same filename with the suffix replaced by
-          .mp4.
+          .mp4. With --hq the filename must end in .mp4 and only that MP4 is
+          written.
         url: Starting URL, bare domain, or local HTML path. Omit this only if
           the first scene has open:.
         sh: Shell command string or argument list to run before python: and
@@ -637,12 +654,26 @@ def video(
     For full YAML syntax documentation, see:
     https://shot-scraper.datasette.io/en/stable/video.html
     """
+    if hq and mp4:
+        raise click.ClickException(
+            "--hq and --mp4 cannot be used together, --hq already produces an MP4"
+        )
     try:
         storyboard_config = load_storyboard(storyboard_file)
     except StoryboardError as ex:
         raise click.ClickException(str(ex))
     if output:
         storyboard_config = storyboard_config.model_copy(update={"output": output})
+    if hq and storyboard_config.output:
+        if not storyboard_config.output.lower().endswith(".mp4"):
+            raise click.ClickException(
+                "--hq encodes directly to mp4, so output: (or -o/--output) "
+                "must use a filename ending in .mp4"
+            )
+        if shutil.which("ffmpeg") is None:
+            raise click.ClickException(
+                "Cannot record with --hq: ffmpeg is not installed or not on PATH"
+            )
     try:
         _record_storyboard(
             storyboard_config,
@@ -660,6 +691,8 @@ def video(
             auth_username=auth_username,
             auth_password=auth_password,
             leave_server=leave_server,
+            hq=hq,
+            page_zoom=page_zoom,
         )
         if mp4:
             _convert_video_to_mp4(storyboard_config.output, silent=silent)
@@ -699,6 +732,101 @@ def _convert_video_to_mp4(output, silent=False):
     if not silent:
         click.echo(f"MP4 written to '{mp4_output}'", err=True)
     return mp4_output
+
+
+HQ_VIDEO_FPS = 30
+
+
+def _cfr_frame_indices(frame_timestamps, stop_ms, fps=HQ_VIDEO_FPS):
+    """
+    Reconstruct a constant frame rate timeline from damage-driven frames.
+
+    Screencast frames arrive once per visual change with epoch-millisecond
+    timestamps and none at all during static holds. Given those timestamps
+    plus the time recording stopped, return one source frame index per
+    output frame: output frame k (at k / fps seconds) shows the most recent
+    source frame at that point in the timeline. The final hold is padded out
+    to stop_ms so trailing pauses keep their real duration.
+    """
+    if not frame_timestamps:
+        raise ValueError("frame_timestamps must not be empty")
+    start_ms = frame_timestamps[0]
+    total_frames = max(1, round((stop_ms - start_ms) * fps / 1000))
+    indices = []
+    source = 0
+    for k in range(total_frames):
+        elapsed_ms = k * 1000 / fps
+        while (
+            source + 1 < len(frame_timestamps)
+            and frame_timestamps[source + 1] - start_ms <= elapsed_ms
+        ):
+            source += 1
+        indices.append(source)
+    return indices
+
+
+def _encode_hq_video(frame_paths, frame_timestamps, stop_ms, output, silent=False):
+    with tempfile.TemporaryDirectory(prefix="shot-scraper-cfr-") as cfr_dir:
+        indices = _cfr_frame_indices(frame_timestamps, stop_ms)
+        for k, source in enumerate(indices):
+            cfr_path = os.path.join(cfr_dir, f"frame-{k:05d}.jpg")
+            try:
+                os.link(frame_paths[source], cfr_path)
+            except OSError:
+                shutil.copyfile(frame_paths[source], cfr_path)
+        args = [
+            "ffmpeg",
+            "-y",
+            "-framerate",
+            str(HQ_VIDEO_FPS),
+            "-i",
+            os.path.join(cfr_dir, "frame-%05d.jpg"),
+            "-c:v",
+            "libx264",
+            "-crf",
+            "10",
+            "-preset",
+            "slow",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            output,
+        ]
+        try:
+            subprocess.run(args, check=True, capture_output=True, text=True)
+        except FileNotFoundError:
+            raise click.ClickException(
+                "Frames were recorded, but MP4 encoding failed: ffmpeg is not "
+                "installed or not on PATH"
+            )
+        except subprocess.CalledProcessError as ex:
+            reason = (ex.stderr or ex.stdout or "").strip()
+            if not reason:
+                reason = f"ffmpeg exited with status {ex.returncode}"
+            raise click.ClickException(
+                f"Frames were recorded, but MP4 encoding failed: {reason}"
+            )
+    if not silent:
+        click.echo(
+            f"Encoded {len(indices)} frames at {HQ_VIDEO_FPS} fps", err=True
+        )
+
+
+def _page_zoom_script(page_zoom):
+    zoom = json.dumps(str(page_zoom))
+    return f"""
+(() => {{
+    function apply() {{
+        if (document.documentElement) {{
+            document.documentElement.style.zoom = {zoom};
+        }} else {{
+            requestAnimationFrame(apply);
+        }}
+    }}
+    apply();
+}})();
+"""
 
 
 @cli.command()
@@ -1699,6 +1827,8 @@ def _record_storyboard(
     auth_username=None,
     auth_password=None,
     leave_server=False,
+    hq=False,
+    page_zoom=None,
 ):
     if skip and fail:
         raise click.ClickException("--skip and --fail cannot be used together")
@@ -1710,6 +1840,9 @@ def _record_storyboard(
     viewport = storyboard_config.viewport_size()
     start_url = storyboard_config.url
     server_processes = []
+    hq_frames_dir = None
+    hq_frames = []  # (epoch ms timestamp, frame path) pairs
+    hq_stop_ms = None
 
     try:
         if storyboard_config.sh is not None:
@@ -1734,6 +1867,8 @@ def _record_storyboard(
                 auth_password=auth_password,
                 viewport=viewport,
             )
+            if page_zoom:
+                context.add_init_script(_page_zoom_script(page_zoom))
             if storyboard_config.cursor and (
                 storyboard_config.cursor.visible or storyboard_config.cursor.clicks
             ):
@@ -1768,7 +1903,29 @@ def _record_storyboard(
                 if storyboard_config.javascript:
                     _evaluate_js(page, storyboard_config.javascript)
 
-                page.screencast.start(path=output, size=viewport)
+                if hq:
+                    # Buffer maximum quality JPEG frames instead of letting
+                    # Playwright encode VP8. Frames are damage-driven: one per
+                    # visual change, none during static holds. size= must be
+                    # passed explicitly or the screencast downscales frames to
+                    # fit 800x800.
+                    hq_frames_dir = tempfile.TemporaryDirectory(
+                        prefix="shot-scraper-hq-"
+                    )
+
+                    def on_hq_frame(frame):
+                        frame_path = os.path.join(
+                            hq_frames_dir.name, f"frame-{len(hq_frames):05d}.jpg"
+                        )
+                        with open(frame_path, "wb") as fp:
+                            fp.write(frame["data"])
+                        hq_frames.append((frame["timestamp"], frame_path))
+
+                    page.screencast.start(
+                        on_frame=on_hq_frame, quality=100, size=viewport
+                    )
+                else:
+                    page.screencast.start(path=output, size=viewport)
                 recording_started = True
                 for index, scene in enumerate(storyboard_config.scenes, 1):
                     _run_storyboard_scene(
@@ -1780,6 +1937,8 @@ def _record_storyboard(
                         silent=silent,
                     )
 
+                if hq:
+                    hq_stop_ms = time.time() * 1000
                 page.screencast.stop()
                 recording_started = False
                 page.close()
@@ -1796,7 +1955,20 @@ def _record_storyboard(
                 if not context_closed:
                     context.close()
                 browser_obj.close()
+
+        if hq:
+            if not hq_frames:
+                raise click.ClickException("No frames were recorded")
+            _encode_hq_video(
+                [frame_path for _, frame_path in hq_frames],
+                [timestamp for timestamp, _ in hq_frames],
+                hq_stop_ms,
+                output,
+                silent=silent,
+            )
     finally:
+        if hq_frames_dir is not None:
+            hq_frames_dir.cleanup()
         if server_processes:
             _cleanup_servers(server_processes, leave_server)
 
