@@ -1,12 +1,16 @@
 import pathlib
+import shutil
+import subprocess
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 import textwrap
 from click.testing import CliRunner
+from playwright.sync_api import sync_playwright
 import pytest
 import shot_scraper.cli as cli_module
 from shot_scraper.cli import cli
+from shot_scraper.video import CursorOptions
 import zipfile
 import json
 from conftest import find_free_port
@@ -515,6 +519,85 @@ scenes:
         ) in result.output
 
 
+HQ_STORYBOARD_YAML = """
+output: {output}
+url: https://example.com/
+scenes:
+- name: One
+  do:
+  - pause: 0.1
+"""
+
+
+def test_video_hq_and_mp4_cannot_be_used_together():
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["video", "-", "--hq", "--mp4"],
+        input=HQ_STORYBOARD_YAML.format(output="demo.mp4"),
+    )
+    assert result.exit_code == 1
+    assert result.output == (
+        "Error: --hq and --mp4 cannot be used together, "
+        "--hq already produces an MP4\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "storyboard_output,args",
+    (
+        ("demo.webm", []),
+        ("demo.mp4", ["-o", "demo.webm"]),
+    ),
+)
+def test_video_hq_requires_mp4_output(storyboard_output, args):
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["video", "-", "--hq"] + args,
+        input=HQ_STORYBOARD_YAML.format(output=storyboard_output),
+    )
+    assert result.exit_code == 1
+    assert result.output == (
+        "Error: --hq encodes directly to mp4, so output: (or -o/--output) "
+        "must use a filename ending in .mp4\n"
+    )
+
+
+def test_video_hq_requires_ffmpeg(mocker):
+    runner = CliRunner()
+    record_storyboard = mocker.patch.object(cli_module, "_record_storyboard")
+    mocker.patch.object(cli_module.shutil, "which", return_value=None)
+
+    result = runner.invoke(
+        cli,
+        ["video", "-", "--hq"],
+        input=HQ_STORYBOARD_YAML.format(output="demo.mp4"),
+    )
+
+    assert result.exit_code == 1
+    assert result.output == (
+        "Error: Cannot record with --hq: ffmpeg is not installed or not on PATH\n"
+    )
+    assert not record_storyboard.called
+
+
+def test_video_hq_and_page_zoom_pass_through_to_recording(mocker):
+    runner = CliRunner()
+    record_storyboard = mocker.patch.object(cli_module, "_record_storyboard")
+    mocker.patch.object(cli_module.shutil, "which", return_value="/usr/bin/ffmpeg")
+
+    result = runner.invoke(
+        cli,
+        ["video", "-", "--hq", "--page-zoom", "2"],
+        input=HQ_STORYBOARD_YAML.format(output="demo.mp4"),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert record_storyboard.call_args.kwargs["hq"] is True
+    assert record_storyboard.call_args.kwargs["page_zoom"] == 2.0
+
+
 def test_video_starts_screencast_after_initial_navigation(mocker):
     events = []
 
@@ -725,6 +808,390 @@ def test_video_runs_top_level_setup_before_server(mocker):
     ]
     assert "scene" in events
     assert events[-1] == "server.kill"
+
+
+def _make_fake_playwright(events, screencast):
+    class FakePage:
+        def __init__(self):
+            self.closed = False
+
+        def set_viewport_size(self, viewport):
+            events.append(("viewport", viewport))
+
+        def evaluate(self, expression):
+            events.append(("evaluate", expression))
+
+        def wait_for_timeout(self, timeout_ms):
+            events.append(("wait_for_timeout", timeout_ms))
+
+        def is_closed(self):
+            return self.closed
+
+        def close(self):
+            events.append("page.close")
+            self.closed = True
+
+    FakePage.screencast = screencast
+
+    class FakeContext:
+        def __init__(self, page):
+            self.page = page
+
+        def add_init_script(self, script):
+            events.append(("init_script", script))
+
+        def new_page(self):
+            return self.page
+
+        def close(self):
+            events.append("context.close")
+
+    class FakeBrowser:
+        def close(self):
+            events.append("browser.close")
+
+    class FakePlaywright:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+    return FakeContext(FakePage()), FakeBrowser(), FakePlaywright()
+
+
+def _hq_storyboard_config(output):
+    return SimpleNamespace(
+        output=output,
+        url="https://example.com/",
+        sh=None,
+        python=None,
+        server=None,
+        cursor=None,
+        wait=None,
+        wait_for=None,
+        wait_for_url=None,
+        javascript=None,
+        scenes=[SimpleNamespace(name="Scene")],
+        viewport_size=lambda: {"width": 640, "height": 360},
+    )
+
+
+@pytest.mark.parametrize("page_zoom", (None, 2.0))
+def test_video_page_zoom_adds_init_script(mocker, page_zoom):
+    events = []
+
+    class FakeScreencast:
+        def start(self, path=None, size=None):
+            events.append(("start", path, size))
+
+        def stop(self):
+            events.append("stop")
+
+    fake_context, fake_browser, fake_playwright = _make_fake_playwright(
+        events, FakeScreencast()
+    )
+    mocker.patch.object(
+        cli_module,
+        "_browser_context",
+        return_value=(fake_context, fake_browser),
+    )
+    mocker.patch.object(cli_module, "sync_playwright", return_value=fake_playwright)
+    mocker.patch.object(
+        cli_module,
+        "_storyboard_goto",
+        side_effect=lambda *args, **kwargs: events.append("goto"),
+    )
+    mocker.patch.object(
+        cli_module,
+        "_run_storyboard_scene",
+        side_effect=lambda *args, **kwargs: events.append("scene"),
+    )
+
+    cli_module._record_storyboard(
+        _hq_storyboard_config("demo.webm"), silent=True, page_zoom=page_zoom
+    )
+
+    init_scripts = [
+        event[1]
+        for event in events
+        if isinstance(event, tuple) and event[0] == "init_script"
+    ]
+    if page_zoom is None:
+        assert init_scripts == []
+    else:
+        assert len(init_scripts) == 1
+        assert 'document.documentElement.style.zoom = "2.0"' in init_scripts[0]
+        # Applied before the first paint, ahead of the screencast starting
+        assert events.index(("init_script", init_scripts[0])) < events.index(
+            ("start", "demo.webm", {"width": 640, "height": 360})
+        )
+
+
+def test_video_hq_records_frames_and_encodes(mocker, tmp_path):
+    events = []
+    captured = {}
+
+    class FakeScreencast:
+        def start(self, on_frame=None, quality=None, size=None, path=None):
+            events.append(("start", quality, size, path))
+            captured["on_frame"] = on_frame
+
+        def stop(self):
+            events.append("stop")
+
+    fake_context, fake_browser, fake_playwright = _make_fake_playwright(
+        events, FakeScreencast()
+    )
+    mocker.patch.object(
+        cli_module,
+        "_browser_context",
+        return_value=(fake_context, fake_browser),
+    )
+    mocker.patch.object(cli_module, "sync_playwright", return_value=fake_playwright)
+    mocker.patch.object(
+        cli_module,
+        "_storyboard_goto",
+        side_effect=lambda *args, **kwargs: events.append("goto"),
+    )
+
+    def run_scene(*args, **kwargs):
+        # Two damage-driven frames arrive while the scene runs: the second
+        # 500ms after the first, followed by a 500ms static hold to stop
+        for offset_ms, data in ((0, b"frame-a"), (500, b"frame-b")):
+            captured["on_frame"](
+                {
+                    "timestamp": 99_000 + offset_ms,
+                    "data": data,
+                    "viewportWidth": 640,
+                    "viewportHeight": 360,
+                }
+            )
+        events.append("scene")
+
+    mocker.patch.object(cli_module, "_run_storyboard_scene", side_effect=run_scene)
+    # Recording stops at epoch 100_000ms: a one second timeline
+    mocker.patch.object(cli_module.time, "time", return_value=100.0)
+
+    def run_ffmpeg(args, **kwargs):
+        sequence = pathlib.Path(args[args.index("-i") + 1])
+        cfr_frames = sorted(sequence.parent.glob("frame-*.jpg"))
+        events.append(
+            ("ffmpeg", args, [path.read_bytes() for path in cfr_frames])
+        )
+        pathlib.Path(args[-1]).write_bytes(b"mp4")
+        return cli_module.subprocess.CompletedProcess(args, 0)
+
+    mocker.patch.object(cli_module.subprocess, "run", side_effect=run_ffmpeg)
+
+    output = str(tmp_path / "demo.mp4")
+    cli_module._record_storyboard(
+        _hq_storyboard_config(output), silent=True, hq=True
+    )
+
+    assert ("start", 100, {"width": 640, "height": 360}, None) in events
+    # The ack-gated frame queue must be flushed by a round-trip before stop
+    assert events.index(("evaluate", "1")) < events.index("stop")
+    ffmpeg_events = [event for event in events if event[0] == "ffmpeg"]
+    assert len(ffmpeg_events) == 1
+    _, args, cfr_contents = ffmpeg_events[0]
+    assert args[:5] == ["ffmpeg", "-y", "-framerate", "30", "-i"]
+    assert args[6:] == [
+        "-vf",
+        "pad=ceil(iw/2)*2:ceil(ih/2)*2:0:0:black",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "10",
+        "-preset",
+        "slow",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        output,
+    ]
+    # One second at 30fps: 15 frames of the first image, 15 of the second
+    assert cfr_contents == [b"frame-a"] * 15 + [b"frame-b"] * 15
+    assert pathlib.Path(output).read_bytes() == b"mp4"
+
+
+@pytest.mark.parametrize(
+    "timestamps,stop_ms,fps,expected",
+    (
+        # A single frame held for two seconds
+        ([5_000], 7_000, 10, [0] * 20),
+        # 0.1s, 0.4s and 0.5s holds at 30fps
+        ([10_000, 10_100, 10_500], 11_000, 30, [0] * 3 + [1] * 12 + [2] * 15),
+        # The trailing hold keeps its full duration up to the stop time
+        ([0, 100], 1_100, 10, [0] + [1] * 10),
+        # The timeline rounds to the nearest whole output frame
+        ([0], 149, 10, [0]),
+        ([0], 151, 10, [0, 0]),
+        # At least one frame even if recording stops immediately
+        ([2_000], 2_000, 30, [0]),
+    ),
+)
+def test_cfr_frame_indices(timestamps, stop_ms, fps, expected):
+    assert cli_module._cfr_frame_indices(timestamps, stop_ms, fps=fps) == expected
+
+
+def test_cfr_frame_indices_requires_frames():
+    with pytest.raises(ValueError):
+        cli_module._cfr_frame_indices([], 1_000)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_video_hq_records_mp4():
+    runner = CliRunner()
+    port = find_free_port()
+    with runner.isolated_filesystem():
+        pathlib.Path("index.html").write_text("""<!DOCTYPE html>
+<html>
+<body style="background: white">
+    <h1>Home</h1>
+    <button id="go"
+        onclick="document.body.style.background = 'black'">Go</button>
+</body>
+</html>""")
+        pathlib.Path("storyboard.yml").write_text(f"""
+output: demo.mp4
+server:
+- {sys.executable}
+- -m
+- http.server
+- {port}
+url: http://localhost:{port}/
+cursor: true
+viewport:
+  width: 640
+  height: 360
+scenes:
+  - name: Home
+    do:
+      - click: "#go"
+      - pause: 0.4
+""".strip())
+        result = runner.invoke(
+            cli, ["video", "storyboard.yml", "--hq", "--page-zoom", "2"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "Recording video to 'demo.mp4'" in result.output
+        assert "Encoded" in result.output
+        assert "Video written to 'demo.mp4'" in result.output
+        video = pathlib.Path("demo.mp4")
+        assert video.exists()
+        header = video.read_bytes()[:12]
+        assert header[4:8] == b"ftyp"
+        assert not pathlib.Path("demo.webm").exists()
+        # The video must contain the interaction, not a frozen first frame:
+        # the click flips the background white -> black, so decoded frames
+        # must include both states (regression for ack-starved frame
+        # delivery, where everything after the last pumping call was lost).
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", "demo.mp4", "-vf", "fps=10", "f-%04d.png"],
+            capture_output=True,
+            check=True,
+        )
+        frames = sorted(pathlib.Path(".").glob("f-*.png"))
+        assert len(frames) > 1
+        digests = {frame.read_bytes() for frame in frames}
+        assert len(digests) > 1, "all decoded frames identical - frozen video"
+        first, last = frames[0].read_bytes(), frames[-1].read_bytes()
+        assert first != last, "post-click state missing from the recording"
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_video_hq_records_pause_only_storyboard():
+    # Regression: with ack-starved delivery a pause-only storyboard produced
+    # zero frames and errored; pumped pauses must record the static page.
+    runner = CliRunner()
+    port = find_free_port()
+    with runner.isolated_filesystem():
+        pathlib.Path("index.html").write_text("<h1>Static</h1>")
+        pathlib.Path("storyboard.yml").write_text(f"""
+output: demo.mp4
+server:
+- {sys.executable}
+- -m
+- http.server
+- {port}
+url: http://localhost:{port}/
+viewport:
+  width: 640
+  height: 360
+scenes:
+  - name: Hold
+    do:
+      - pause: 1.0
+""".strip())
+        result = runner.invoke(cli, ["video", "storyboard.yml", "--hq"])
+        assert result.exit_code == 0, result.output
+        assert pathlib.Path("demo.mp4").exists()
+
+
+CURSOR_ZOOM_PAGE = """<!DOCTYPE html>
+<html>
+<body style="margin: 0; min-height: 1200px">
+    <button id="target"
+        style="position: absolute; left: 220px; top: 140px; width: 90px; height: 40px">
+        Click me
+    </button>
+</body>
+</html>"""
+
+
+@pytest.mark.parametrize("zoom", (1, 2))
+def test_video_cursor_overlay_tracks_clicks_under_css_zoom(http_server, zoom):
+    (http_server.base_dir / "index.html").write_text(CURSOR_ZOOM_PAGE)
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        try:
+            context = browser.new_context(viewport={"width": 800, "height": 600})
+            context.add_init_script(
+                cli_module._storyboard_cursor_script(CursorOptions())
+            )
+            page = context.new_page()
+            page.goto(http_server.base_url)
+            page.evaluate(
+                "zoom => document.documentElement.style.zoom = zoom", str(zoom)
+            )
+            page.locator("#target").click()
+            # Wait out the cursor's 120ms position transition
+            page.wait_for_timeout(300)
+            distances = page.evaluate("""
+                () => {
+                    const center = (el) => {
+                        const rect = el.getBoundingClientRect();
+                        return [rect.x + rect.width / 2, rect.y + rect.height / 2];
+                    };
+                    const [targetX, targetY] = center(
+                        document.getElementById("target")
+                    );
+                    const distance = (el) => {
+                        const [x, y] = center(el);
+                        return Math.hypot(x - targetX, y - targetY);
+                    };
+                    return {
+                        cursor: distance(
+                            document.getElementById("shot-scraper-cursor")
+                        ),
+                        ring: distance(
+                            document.querySelector(".shot-scraper-click-ring")
+                        ),
+                    };
+                }
+            """)
+        finally:
+            browser.close()
+
+    # getBoundingClientRect() values are multiplied by the effective CSS zoom,
+    # so divide to compare in document CSS pixels. Without the zoom fix the
+    # zoom=2 cursor would render a full viewport-quadrant away (hundreds of
+    # pixels); the small tolerances absorb the overlay's cosmetic border
+    # offset (the negative margins centre the content box, not the border).
+    assert distances["cursor"] / zoom <= 3
+    assert distances["ring"] / zoom <= 5
 
 
 @pytest.mark.parametrize(
@@ -987,3 +1454,50 @@ def test_har_extract_content_type_extension(http_server):
         assert (
             len(html_files) >= 1
         ), f"Should have .html file, got: {list(extract_dir.glob('*'))}"
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_hq_encode_pads_odd_viewport_dimensions(tmpdir):
+    # yuv420p rejects odd dimensions; the encoder must pad rather than fail
+    # after a completed capture (fork PR #1 review finding).
+    frames = []
+    for i in range(3):
+        frame_path = str(tmpdir / "frame-{:05d}.jpg".format(i))
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=white:s=641x361",
+                "-frames:v",
+                "1",
+                frame_path,
+            ],
+            capture_output=True,
+            check=True,
+        )
+        frames.append(frame_path)
+    output = str(tmpdir / "out.mp4")
+    cli_module._encode_hq_video(
+        frames, [1000.0, 1400.0, 1800.0], 2000.0, output, silent=True
+    )
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0",
+            output,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert probe.stdout.strip() == "642,362"
