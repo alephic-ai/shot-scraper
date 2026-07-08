@@ -1899,7 +1899,7 @@ def _record_storyboard(
                     )
 
                 if storyboard_config.wait is not None:
-                    _storyboard_pause(storyboard_config.wait)
+                    _storyboard_pause(page, storyboard_config.wait)
                 if storyboard_config.wait_for:
                     _storyboard_wait_for(page, storyboard_config.wait_for)
                 if storyboard_config.wait_for_url:
@@ -1942,6 +1942,10 @@ def _record_storyboard(
                     )
 
                 if hq:
+                    # Frame delivery is ack-gated on the client pumping the
+                    # connection; a cheap round-trip flushes anything still
+                    # queued before stop() would discard it.
+                    page.evaluate("1")
                     hq_stop_ms = time.time() * 1000
                 page.screencast.stop()
                 recording_started = False
@@ -2026,7 +2030,7 @@ def _run_storyboard_action(
     elif isinstance(action, ScrollAction):
         _storyboard_scroll(page, action)
     elif isinstance(action, PauseAction):
-        _storyboard_pause(action.seconds)
+        _storyboard_pause(page, action.seconds)
     elif isinstance(action, WaitForAction):
         _storyboard_wait_for(page, action.selector)
     elif isinstance(action, WaitForUrlAction):
@@ -2073,14 +2077,18 @@ def _storyboard_wait_for(page, selector):
     page.locator(selector).wait_for()
 
 
-def _storyboard_pause(seconds):
+def _storyboard_pause(page, seconds):
     try:
         seconds = float(seconds)
     except (TypeError, ValueError):
         raise click.ClickException("pause values must be numbers")
     if seconds < 0:
         raise click.ClickException("pause values must not be negative")
-    time.sleep(seconds)
+    # wait_for_timeout (not time.sleep) so the Playwright connection keeps
+    # pumping while we hold: screencast frame delivery is ack-gated, and a
+    # bare sleep starves it — frames rendered during the hold would be
+    # dropped or delivered too late for --hq recordings.
+    page.wait_for_timeout(seconds * 1000)
 
 
 def _storyboard_scroll(page, value):
@@ -2092,7 +2100,7 @@ def _storyboard_scroll(page, value):
             page.locator(selector).evaluate(
                 "(el) => el.scrollIntoView({behavior: 'smooth', block: 'center'})"
             )
-            time.sleep(duration)
+            page.wait_for_timeout(duration * 1000)
         else:
             page.locator(selector).scroll_into_view_if_needed()
         return

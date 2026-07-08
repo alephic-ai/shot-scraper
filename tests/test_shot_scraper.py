@@ -818,6 +818,12 @@ def _make_fake_playwright(events, screencast):
         def set_viewport_size(self, viewport):
             events.append(("viewport", viewport))
 
+        def evaluate(self, expression):
+            events.append(("evaluate", expression))
+
+        def wait_for_timeout(self, timeout_ms):
+            events.append(("wait_for_timeout", timeout_ms))
+
         def is_closed(self):
             return self.closed
 
@@ -984,6 +990,8 @@ def test_video_hq_records_frames_and_encodes(mocker, tmp_path):
     )
 
     assert ("start", 100, {"width": 640, "height": 360}, None) in events
+    # The ack-gated frame queue must be flushed by a round-trip before stop
+    assert events.index(("evaluate", "1")) < events.index("stop")
     ffmpeg_events = [event for event in events if event[0] == "ffmpeg"]
     assert len(ffmpeg_events) == 1
     _, args, cfr_contents = ffmpeg_events[0]
@@ -1040,9 +1048,10 @@ def test_video_hq_records_mp4():
     with runner.isolated_filesystem():
         pathlib.Path("index.html").write_text("""<!DOCTYPE html>
 <html>
-<body>
+<body style="background: white">
     <h1>Home</h1>
-    <button id="go">Go</button>
+    <button id="go"
+        onclick="document.body.style.background = 'black'">Go</button>
 </body>
 </html>""")
         pathlib.Path("storyboard.yml").write_text(f"""
@@ -1075,6 +1084,50 @@ scenes:
         header = video.read_bytes()[:12]
         assert header[4:8] == b"ftyp"
         assert not pathlib.Path("demo.webm").exists()
+        # The video must contain the interaction, not a frozen first frame:
+        # the click flips the background white -> black, so decoded frames
+        # must include both states (regression for ack-starved frame
+        # delivery, where everything after the last pumping call was lost).
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", "demo.mp4", "-vf", "fps=10", "f-%04d.png"],
+            capture_output=True,
+            check=True,
+        )
+        frames = sorted(pathlib.Path(".").glob("f-*.png"))
+        assert len(frames) > 1
+        digests = {frame.read_bytes() for frame in frames}
+        assert len(digests) > 1, "all decoded frames identical - frozen video"
+        first, last = frames[0].read_bytes(), frames[-1].read_bytes()
+        assert first != last, "post-click state missing from the recording"
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_video_hq_records_pause_only_storyboard():
+    # Regression: with ack-starved delivery a pause-only storyboard produced
+    # zero frames and errored; pumped pauses must record the static page.
+    runner = CliRunner()
+    port = find_free_port()
+    with runner.isolated_filesystem():
+        pathlib.Path("index.html").write_text("<h1>Static</h1>")
+        pathlib.Path("storyboard.yml").write_text(f"""
+output: demo.mp4
+server:
+- {sys.executable}
+- -m
+- http.server
+- {port}
+url: http://localhost:{port}/
+viewport:
+  width: 640
+  height: 360
+scenes:
+  - name: Hold
+    do:
+      - pause: 1.0
+""".strip())
+        result = runner.invoke(cli, ["video", "storyboard.yml", "--hq"])
+        assert result.exit_code == 0, result.output
+        assert pathlib.Path("demo.mp4").exists()
 
 
 CURSOR_ZOOM_PAGE = """<!DOCTYPE html>
