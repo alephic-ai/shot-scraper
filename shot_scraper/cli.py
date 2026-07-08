@@ -2032,12 +2032,40 @@ def _storyboard_cursor_script(cursor):
             document.body.appendChild(cursor);
         }}
 
+        // Event clientX/clientY are viewport CSS pixels (unzoomed), but the
+        // overlay elements live inside the document, so any CSS zoom on
+        // <html>/<body> multiplies their rendered position. Divide the
+        // coordinates by the cumulative zoom so the overlay stays at the
+        // true pointer position. No-op when zoom is 1.
+        function effectiveZoom() {{
+            const anchor = document.body || document.documentElement;
+            if (
+                anchor &&
+                typeof anchor.currentCSSZoom === "number" &&
+                anchor.currentCSSZoom > 0
+            ) {{
+                return anchor.currentCSSZoom;
+            }}
+            let zoom = 1;
+            for (const node of [document.documentElement, document.body]) {{
+                if (!node) {{
+                    continue;
+                }}
+                const value = parseFloat(getComputedStyle(node).zoom);
+                if (Number.isFinite(value) && value > 0) {{
+                    zoom *= value;
+                }}
+            }}
+            return zoom > 0 ? zoom : 1;
+        }}
+
         function move(event) {{
             if (!cursor) {{
                 return;
             }}
-            cursor.style.left = `${{event.clientX}}px`;
-            cursor.style.top = `${{event.clientY}}px`;
+            const zoom = effectiveZoom();
+            cursor.style.left = `${{event.clientX / zoom}}px`;
+            cursor.style.top = `${{event.clientY / zoom}}px`;
             cursor.style.opacity = "1";
         }}
 
@@ -2045,10 +2073,11 @@ def _storyboard_cursor_script(cursor):
             if (!options.clicks) {{
                 return;
             }}
+            const zoom = effectiveZoom();
             const el = document.createElement("div");
             el.className = "shot-scraper-click-ring";
-            el.style.left = `${{event.clientX}}px`;
-            el.style.top = `${{event.clientY}}px`;
+            el.style.left = `${{event.clientX / zoom}}px`;
+            el.style.top = `${{event.clientY / zoom}}px`;
             document.body.appendChild(el);
             setTimeout(() => el.remove(), 700);
         }}

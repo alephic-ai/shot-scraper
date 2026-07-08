@@ -4,9 +4,11 @@ from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 import textwrap
 from click.testing import CliRunner
+from playwright.sync_api import sync_playwright
 import pytest
 import shot_scraper.cli as cli_module
 from shot_scraper.cli import cli
+from shot_scraper.video import CursorOptions
 import zipfile
 import json
 from conftest import find_free_port
@@ -725,6 +727,70 @@ def test_video_runs_top_level_setup_before_server(mocker):
     ]
     assert "scene" in events
     assert events[-1] == "server.kill"
+
+
+CURSOR_ZOOM_PAGE = """<!DOCTYPE html>
+<html>
+<body style="margin: 0; min-height: 1200px">
+    <button id="target"
+        style="position: absolute; left: 220px; top: 140px; width: 90px; height: 40px">
+        Click me
+    </button>
+</body>
+</html>"""
+
+
+@pytest.mark.parametrize("zoom", (1, 2))
+def test_video_cursor_overlay_tracks_clicks_under_css_zoom(http_server, zoom):
+    (http_server.base_dir / "index.html").write_text(CURSOR_ZOOM_PAGE)
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        try:
+            context = browser.new_context(viewport={"width": 800, "height": 600})
+            context.add_init_script(
+                cli_module._storyboard_cursor_script(CursorOptions())
+            )
+            page = context.new_page()
+            page.goto(http_server.base_url)
+            page.evaluate(
+                "zoom => document.documentElement.style.zoom = zoom", str(zoom)
+            )
+            page.locator("#target").click()
+            # Wait out the cursor's 120ms position transition
+            page.wait_for_timeout(300)
+            distances = page.evaluate("""
+                () => {
+                    const center = (el) => {
+                        const rect = el.getBoundingClientRect();
+                        return [rect.x + rect.width / 2, rect.y + rect.height / 2];
+                    };
+                    const [targetX, targetY] = center(
+                        document.getElementById("target")
+                    );
+                    const distance = (el) => {
+                        const [x, y] = center(el);
+                        return Math.hypot(x - targetX, y - targetY);
+                    };
+                    return {
+                        cursor: distance(
+                            document.getElementById("shot-scraper-cursor")
+                        ),
+                        ring: distance(
+                            document.querySelector(".shot-scraper-click-ring")
+                        ),
+                    };
+                }
+            """)
+        finally:
+            browser.close()
+
+    # getBoundingClientRect() values are multiplied by the effective CSS zoom,
+    # so divide to compare in document CSS pixels. Without the zoom fix the
+    # zoom=2 cursor would render a full viewport-quadrant away (hundreds of
+    # pixels); the small tolerances absorb the overlay's cosmetic border
+    # offset (the negative margins centre the content box, not the border).
+    assert distances["cursor"] / zoom <= 3
+    assert distances["ring"] / zoom <= 5
 
 
 @pytest.mark.parametrize(
